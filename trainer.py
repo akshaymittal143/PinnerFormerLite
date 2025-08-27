@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import logging
 from tqdm import tqdm
 import time
@@ -287,6 +287,49 @@ class Evaluator:
         recall = hits.float().mean().item()
         return recall
     
+    def compute_ndcg_at_k(
+        self,
+        user_embeddings: torch.Tensor,
+        positive_items: torch.Tensor,
+        all_items: torch.Tensor,
+        k: int = 10
+    ) -> float:
+        """
+        Compute NDCG@K (Normalized Discounted Cumulative Gain).
+        
+        Args:
+            user_embeddings: User embeddings [batch_size, d_model]
+            positive_items: Positive item indices [batch_size]
+            all_items: All item embeddings [num_items, d_model]
+            k: Number of top items to consider
+            
+        Returns:
+            NDCG@K score
+        """
+        # Compute similarities
+        similarities = torch.mm(user_embeddings, all_items.t())  # [batch_size, num_items]
+        
+        # Get top-k items and their scores
+        top_k_scores, top_k_indices = torch.topk(similarities, k, dim=1)  # [batch_size, k]
+        
+        # Create relevance scores (1 for positive items, 0 for others)
+        relevance = torch.zeros_like(similarities)
+        relevance.scatter_(1, positive_items.unsqueeze(1), 1.0)
+        
+        # Get relevance scores for top-k items
+        top_k_relevance = torch.gather(relevance, 1, top_k_indices)  # [batch_size, k]
+        
+        # Compute DCG
+        dcg = torch.sum(top_k_relevance / torch.log2(torch.arange(2, k + 2, device=top_k_relevance.device).float()), dim=1)
+        
+        # Compute IDCG (ideal DCG)
+        ideal_relevance = torch.sort(top_k_relevance, dim=1, descending=True)[0]
+        idcg = torch.sum(ideal_relevance / torch.log2(torch.arange(2, k + 2, device=ideal_relevance.device).float()), dim=1)
+        
+        # Compute NDCG
+        ndcg = torch.mean(dcg / (idcg + 1e-8)).item()
+        return ndcg
+    
     def compute_interest_entropy(
         self,
         user_embeddings: torch.Tensor,
@@ -426,13 +469,92 @@ class Evaluator:
         
         # Compute metrics
         recall_at_10 = self.compute_recall_at_k(user_embeddings, positive_items, all_items_embedding, k=10)
+        ndcg_at_10 = self.compute_ndcg_at_k(user_embeddings, positive_items, all_items_embedding, k=10)
         interest_entropy_50 = self.compute_interest_entropy(user_embeddings, all_items_embedding, k=50)
         coverage_10 = self.compute_coverage(user_embeddings, all_items_embedding, k=10, percentile=90)
         
         return {
             'recall_at_10': recall_at_10,
+            'ndcg_at_10': ndcg_at_10,
             'interest_entropy_50': interest_entropy_50,
             'p90_coverage_10': coverage_10
+        }
+
+    def evaluate_fairness(
+        self,
+        test_loader: DataLoader,
+        all_item_embeddings: torch.Tensor,
+        power_users: Set[int],
+        general_users: Set[int]
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Evaluate fairness by comparing performance between power users and general users.
+        
+        Args:
+            test_loader: Test data loader
+            all_item_embeddings: All item embeddings
+            power_users: Set of power user IDs
+            general_users: Set of general user IDs
+            
+        Returns:
+            Dictionary containing metrics for both user groups
+        """
+        self.model.eval()
+        
+        all_user_embeddings = []
+        all_user_ids = []
+        all_positive_items = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                user_ids = batch['user_id'].to(self.device)
+                sequences = batch['sequence'].to(self.device)
+                seq_lengths = batch['seq_length'].to(self.device)
+                
+                # Create attention mask
+                attention_mask = torch.arange(sequences.size(1)).unsqueeze(0) < seq_lengths.unsqueeze(1)
+                attention_mask = attention_mask.to(self.device)
+                
+                # Forward pass
+                user_embeddings, _ = self.model(user_ids, sequences, attention_mask)
+                
+                all_user_embeddings.append(user_embeddings)
+                all_user_ids.extend(user_ids.cpu().numpy())
+                all_positive_items.extend(sequences[:, -1].cpu().numpy())
+        
+        all_user_embeddings = torch.cat(all_user_embeddings, dim=0)
+        all_user_ids = np.array(all_user_ids)
+        all_positive_items = torch.tensor(all_positive_items)
+        
+        # Evaluate power users
+        power_user_mask = torch.tensor([uid in power_users for uid in all_user_ids])
+        if power_user_mask.sum() > 0:
+            power_user_embeddings = all_user_embeddings[power_user_mask]
+            power_user_positive_items = all_positive_items[power_user_mask]
+            
+            power_user_metrics = {
+                'recall_at_10': self.compute_recall_at_k(power_user_embeddings, power_user_positive_items, all_item_embeddings, k=10),
+                'ndcg_at_10': self.compute_ndcg_at_k(power_user_embeddings, power_user_positive_items, all_item_embeddings, k=10)
+            }
+        else:
+            power_user_metrics = {'recall_at_10': 0.0, 'ndcg_at_10': 0.0}
+        
+        # Evaluate general users
+        general_user_mask = torch.tensor([uid in general_users for uid in all_user_ids])
+        if general_user_mask.sum() > 0:
+            general_user_embeddings = all_user_embeddings[general_user_mask]
+            general_user_positive_items = all_positive_items[general_user_mask]
+            
+            general_user_metrics = {
+                'recall_at_10': self.compute_recall_at_k(general_user_embeddings, general_user_positive_items, all_item_embeddings, k=10),
+                'ndcg_at_10': self.compute_ndcg_at_k(general_user_embeddings, general_user_positive_items, all_item_embeddings, k=10)
+            }
+        else:
+            general_user_metrics = {'recall_at_10': 0.0, 'ndcg_at_10': 0.0}
+        
+        return {
+            'power_users': power_user_metrics,
+            'general_users': general_user_metrics
         }
 
 
@@ -538,6 +660,10 @@ def run_experiment(
     # Evaluate on power users only
     power_user_metrics = evaluator.evaluate_model(test_loader, all_item_embeddings, power_users)
     
+    # Evaluate fairness between power users and general users
+    general_users = data_dict.get('general_users', set())
+    fairness_metrics = evaluator.evaluate_fairness(test_loader, all_item_embeddings, power_users, general_users)
+    
     # Save results
     results = {
         'experiment_name': experiment_name,
@@ -546,6 +672,8 @@ def run_experiment(
         'training_history': history,
         'all_user_metrics': all_user_metrics,
         'power_user_metrics': power_user_metrics,
+        'fairness_metrics': fairness_metrics,
+        'sensitivity_results': data_dict.get('sensitivity_results', {}),
         'dataset_stats': data_dict['stats']
     }
     

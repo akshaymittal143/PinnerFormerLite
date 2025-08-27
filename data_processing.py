@@ -144,6 +144,86 @@ class MovieLensDataProcessor:
         
         return power_users
     
+    def identify_general_users(
+        self,
+        sequences: Dict[int, List[int]],
+        horror_threshold: float = 0.1
+    ) -> Set[int]:
+        """
+        Identify general users with low horror movie affinity for fairness analysis.
+        
+        Args:
+            sequences: User sequences
+            horror_threshold: Maximum fraction of horror movies to be considered a general user
+            
+        Returns:
+            Set of general user IDs
+        """
+        logger.info("Identifying general users for fairness analysis...")
+        
+        general_users = set()
+        
+        for user_id, sequence in sequences.items():
+            horror_count = sum(1 for item_id in sequence if item_id in self.horror_items)
+            horror_fraction = horror_count / len(sequence)
+            
+            if horror_fraction <= horror_threshold:
+                general_users.add(user_id)
+        
+        logger.info(f"Identified {len(general_users):,} general users")
+        
+        return general_users
+    
+    def sensitivity_analysis_power_users(
+        self,
+        sequences: Dict[int, List[int]],
+        thresholds: List[float] = [0.4, 0.5, 0.6]
+    ) -> Dict[float, Dict[str, int]]:
+        """
+        Perform sensitivity analysis for different power user thresholds.
+        
+        Args:
+            sequences: User sequences
+            thresholds: List of horror affinity thresholds to test
+            
+        Returns:
+            Dictionary with threshold as key and statistics as value
+        """
+        logger.info("Performing power user threshold sensitivity analysis...")
+        
+        results = {}
+        
+        for threshold in thresholds:
+            power_users = self.identify_power_users(sequences, horror_threshold=threshold)
+            
+            # Calculate statistics
+            total_users = len(sequences)
+            power_user_count = len(power_users)
+            power_user_percentage = (power_user_count / total_users) * 100 if total_users > 0 else 0
+            
+            # Calculate average horror affinity for power users
+            total_horror_affinity = 0
+            for user_id in power_users:
+                if user_id in sequences:
+                    sequence = sequences[user_id]
+                    horror_count = sum(1 for item_id in sequence if item_id in self.horror_items)
+                    horror_fraction = horror_count / len(sequence)
+                    total_horror_affinity += horror_fraction
+            
+            avg_horror_affinity = total_horror_affinity / power_user_count if power_user_count > 0 else 0
+            
+            results[threshold] = {
+                'power_user_count': power_user_count,
+                'power_user_percentage': power_user_percentage,
+                'avg_horror_affinity': avg_horror_affinity,
+                'total_users': total_users
+            }
+            
+            logger.info(f"Threshold {threshold:.1%}: {power_user_count:,} power users "
+                       f"({power_user_percentage:.1f}%), avg affinity: {avg_horror_affinity:.3f}")
+        
+        return results
+    
     def create_distilled_dataset(
         self, 
         sequences: Dict[int, List[int]], 
@@ -257,8 +337,14 @@ class MovieLensDataProcessor:
         # Create sequences
         sequences = self.create_sequences()
         
-        # Identify power users
-        power_users = self.identify_power_users(sequences)
+        # Perform sensitivity analysis for power user thresholds
+        sensitivity_results = self.sensitivity_analysis_power_users(sequences)
+        
+        # Identify power users (using 50% threshold as per paper)
+        power_users = self.identify_power_users(sequences, horror_threshold=0.5)
+        
+        # Identify general users for fairness analysis
+        general_users = self.identify_general_users(sequences, horror_threshold=0.1)
         
         # Create distilled dataset
         distilled_sequences = self.create_distilled_dataset(sequences, power_users)
@@ -280,6 +366,8 @@ class MovieLensDataProcessor:
             'sequences': sequences,
             'distilled_sequences': distilled_sequences,
             'power_users': power_users,
+            'general_users': general_users,
+            'sensitivity_results': sensitivity_results,
             'train_sequences': train_sequences,
             'val_sequences': val_sequences,
             'test_sequences': test_sequences,

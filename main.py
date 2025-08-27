@@ -86,6 +86,13 @@ def main():
     logger.info(f"  Average sequence length: {data_dict['stats']['avg_seq_length']:.2f}")
     logger.info(f"  Horror interactions: {data_dict['stats']['horror_interactions']:,}")
     logger.info(f"  Power users: {len(data_dict['power_users']):,}")
+    logger.info(f"  General users: {len(data_dict['general_users']):,}")
+    
+    # Print sensitivity analysis results
+    logger.info("Power User Threshold Sensitivity Analysis:")
+    for threshold, stats in data_dict['sensitivity_results'].items():
+        logger.info(f"  {threshold:.1%} threshold: {stats['power_user_count']:,} users "
+                   f"({stats['power_user_percentage']:.1f}%), avg affinity: {stats['avg_horror_affinity']:.3f}")
     
     logger.info("Distilled Dataset Statistics:")
     logger.info(f"  Users: {data_dict['distilled_stats']['num_users']:,}")
@@ -133,6 +140,14 @@ def main():
     for metric, value in results['power_user_metrics'].items():
         logger.info(f"  {metric}: {value:.4f}")
     
+    logger.info("Fairness Analysis:")
+    logger.info("  Power Users:")
+    for metric, value in results['fairness_metrics']['power_users'].items():
+        logger.info(f"    {metric}: {value:.4f}")
+    logger.info("  General Users:")
+    for metric, value in results['fairness_metrics']['general_users'].items():
+        logger.info(f"    {metric}: {value:.4f}")
+    
     # Save final results summary
     summary = {
         'experiment_name': args.experiment_name,
@@ -140,8 +155,10 @@ def main():
         'training_config': training_config,
         'results': {
             'all_users': results['all_user_metrics'],
-            'power_users': results['power_user_metrics']
+            'power_users': results['power_user_metrics'],
+            'fairness_analysis': results['fairness_metrics']
         },
+        'sensitivity_analysis': results['sensitivity_results'],
         'dataset_stats': data_dict['stats']
     }
     
@@ -240,6 +257,36 @@ def run_comparison_experiments():
         weighted_val = weighted_results['power_user_metrics'][metric]
         improvement = ((weighted_val - generic_val) / generic_val) * 100
         logger.info(f"  {metric}: {improvement:+.1f}%")
+    
+    logger.info("\nFAIRNESS ANALYSIS:")
+    logger.info("Generic Model:")
+    logger.info("  Power Users:")
+    for metric, value in generic_results['fairness_metrics']['power_users'].items():
+        logger.info(f"    {metric}: {value:.4f}")
+    logger.info("  General Users:")
+    for metric, value in generic_results['fairness_metrics']['general_users'].items():
+        logger.info(f"    {metric}: {value:.4f}")
+    
+    logger.info("Weighted Model:")
+    logger.info("  Power Users:")
+    for metric, value in weighted_results['fairness_metrics']['power_users'].items():
+        logger.info(f"    {metric}: {value:.4f}")
+    logger.info("  General Users:")
+    for metric, value in weighted_results['fairness_metrics']['general_users'].items():
+        logger.info(f"    {metric}: {value:.4f}")
+    
+    # Calculate fairness impact
+    logger.info("\nFAIRNESS IMPACT:")
+    for metric in ['recall_at_10', 'ndcg_at_10']:
+        generic_power = generic_results['fairness_metrics']['power_users'][metric]
+        generic_general = generic_results['fairness_metrics']['general_users'][metric]
+        weighted_power = weighted_results['fairness_metrics']['power_users'][metric]
+        weighted_general = weighted_results['fairness_metrics']['general_users'][metric]
+        
+        power_improvement = ((weighted_power - generic_power) / generic_power) * 100
+        general_change = ((weighted_general - generic_general) / generic_general) * 100
+        
+        logger.info(f"  {metric} - Power Users: {power_improvement:+.1f}%, General Users: {general_change:+.1f}%")
     
     logger.info("\nExperiments completed successfully!")
 
